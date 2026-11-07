@@ -93,10 +93,16 @@ trap 'rm -rf "$workdir"' EXIT INT TERM
 say "Downloading $archive (v$version)..."
 curl -fsSL "$base/$archive" -o "$workdir/$archive" ||
     err "download failed: $base/$archive"
-curl -fsSL "$base/$archive.sha256" -o "$workdir/$archive.sha256" ||
-    err "checksum download failed: $base/$archive.sha256"
+# Release tooling names the checksum after the archive stem; fall back to
+# "<archive>.sha256" for other layouts.
+checksum="$BIN-$target.sha256"
+if ! curl -fsSL "$base/$checksum" -o "$workdir/$checksum" 2>/dev/null; then
+    checksum="$archive.sha256"
+    curl -fsSL "$base/$checksum" -o "$workdir/$checksum" ||
+        err "checksum download failed: $base/$checksum"
+fi
 
-expected=$(awk 'NR == 1 { print $1 }' "$workdir/$archive.sha256")
+expected=$(awk 'NR == 1 { print $1 }' "$workdir/$checksum")
 [ -n "$expected" ] || err "empty checksum file for $archive"
 actual=$(sha256_of "$workdir/$archive")
 [ "$expected" = "$actual" ] ||
