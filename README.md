@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/zhuzhda/deepseek-web-mcp/main/insta
 
 The script detects the platform, downloads the matching archive from the latest
 GitHub release, verifies its `sha256`, and installs to `${DEEPSEEK_INSTALL_DIR:-$HOME/.local/bin}`.
-Use `VERSION=0.2.0` to pin a release.
+Use `VERSION=0.3.0` to pin a release.
 
 ### From crates.io (needs Rust 1.89+)
 
@@ -65,13 +65,24 @@ Binary: `~/.cargo/bin/deepseek-web-mcp`. From a checkout: `cargo install --path 
 
 ### Windows
 
-Download `deepseek-web-mcp-x86_64-pc-windows-msvc.zip` from the
-[latest release](https://github.com/zhuzhda/deepseek-web-mcp/releases/latest),
-unpack it, and make sure `deepseek-web-mcp.exe` is on `PATH` (or reference it by full path):
+```powershell
+irm https://raw.githubusercontent.com/zhuzhda/deepseek-web-mcp/main/install.ps1 | iex
+```
+
+The script downloads `deepseek-web-mcp-x86_64-pc-windows-msvc.zip` from the latest
+release, verifies its `sha256`, unpacks `deepseek-web-mcp.exe` into
+`%LOCALAPPDATA%\deepseek-web-mcp` and prints the PATH instructions. It does not touch
+`PATH` unless you pass `-AddToPath`:
 
 ```powershell
-& "$HOME\.local\bin\deepseek-web-mcp.exe" --version
+$script = "$env:TEMP\install-deepseek.ps1"
+irm https://raw.githubusercontent.com/zhuzhda/deepseek-web-mcp/main/install.ps1 -OutFile $script
+. $script -Version 0.3.0 -InstallDir "C:\Tools\deepseek-web-mcp" -AddToPath
 ```
+
+Without a script: download the `.zip` from the
+[latest release](https://github.com/zhuzhda/deepseek-web-mcp/releases/latest),
+unpack it and reference `deepseek-web-mcp.exe` by full path.
 
 The Windows build uses a static CRT, so no Visual C++ Redistributable is required.
 `cargo binstall deepseek-web-mcp` picks the `.zip` automatically.
@@ -166,8 +177,13 @@ Releases are produced by `.github/workflows/release.yml` on a `v*` tag:
 `x86_64`/`aarch64` Linux (musl), `x86_64`/`aarch64` macOS and `x86_64` Windows,
 each with a `sha256` checksum.
 
-Known limitation: cancelling a tool call in the client does not abort the
-in-flight HTTP request, because the blocking `ureq` call runs on a worker thread.
+Cancelling a tool call in the client (`notifications/cancelled`) aborts the
+in-flight HTTP request: the request future is dropped, which closes the connection
+instead of letting it run in the background.
+
+Binary size is ~3 MiB (Linux x86_64 musl) and startup is ~2 ms; the async HTTP
+client (`reqwest` + `rustls` with the *ring* provider, no C toolchain needed) costs
+about 280 KiB over the previous blocking client.
 
 ## License
 

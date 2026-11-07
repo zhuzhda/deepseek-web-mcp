@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt, handler::server::wrapper::Parameters,
-    model::CallToolResult, schemars, tool, tool_handler, tool_router, transport::stdio,
+    ErrorData, RoleServer, ServerHandler, ServiceExt, handler::server::wrapper::Parameters,
+    model::CallToolResult, schemars, service::RequestContext, tool, tool_handler, tool_router,
+    transport::stdio,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -140,52 +141,49 @@ impl FetchParams {
 }
 
 /// HTTP client shared by the tools and by `--check`.
+///
+/// Requests are plain futures, so dropping one (for example when the MCP client
+/// cancels a tool call) aborts the connection instead of leaking a worker thread.
 struct Client {
     api_key: Arc<str>,
     base_url: Arc<str>,
     max_body: u64,
-    agent: ureq::Agent,
+    timeout: Duration,
+    http: reqwest::Client,
 }
 
 impl Client {
-    fn new(config: &Config) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(config.timeout))
-            .http_status_as_error(false)
+    fn new(config: &Config) -> Result<Self, ErrorData> {
+        install_crypto_provider();
+        let http = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .user_agent(concat!("deepseek-web-mcp/", env!("CARGO_PKG_VERSION")))
             .build()
-            .into();
-        Self {
+            .map_err(|e| internal(format!("cannot build HTTP client: {e}")))?;
+        Ok(Self {
             api_key: Arc::from(config.api_key.as_str()),
             base_url: Arc::from(config.base_url.as_str()),
             max_body: config.max_body,
-            agent,
-        }
+            timeout: config.timeout,
+            http,
+        })
     }
 
-    fn request(&self, path: &str, body: &impl Serialize) -> Result<Value, ErrorData> {
-        let body =
-            serde_json::to_string(body).map_err(|e| internal(format!("invalid body: {e}")))?;
+    async fn request(&self, path: &str, body: &impl Serialize) -> Result<Value, ErrorData> {
+        let payload =
+            serde_json::to_vec(body).map_err(|e| internal(format!("invalid body: {e}")))?;
         let url = format!("{}{path}", self.base_url);
-        let auth = format!("Bearer {}", self.api_key);
         let mut resp = self
-            .agent
+            .http
             .post(&url)
-            .header("Authorization", &auth)
-            .header("Content-Type", "application/json")
-            .send(body)
-            .map_err(|e| internal(format!("request to {url} failed: {e}")))?;
+            .bearer_auth(&*self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
+            .send()
+            .await
+            .map_err(|e| self.request_error(&url, &e))?;
         let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .with_config()
-            .limit(self.max_body)
-            .lossy_utf8(true)
-            .read_to_string()
-            .map_err(|e| {
-                internal(format!(
-                    "reading DeepSeek response failed (HTTP {status}): {e}"
-                ))
-            })?;
+        let text = self.read_body(&mut resp, status).await?;
         if (200..300).contains(&status) {
             serde_json::from_str(&text)
                 .map_err(|e| internal(format!("invalid JSON from DeepSeek API: {e}")))
@@ -193,6 +191,52 @@ impl Client {
             Err(status_error(status, &text))
         }
     }
+
+    /// Stream the body, enforcing `DEEPSEEK_MAX_BODY_MB` without buffering more
+    /// than the limit. Every `await` here is a cancellation point.
+    async fn read_body(
+        &self,
+        resp: &mut reqwest::Response,
+        status: u16,
+    ) -> Result<String, ErrorData> {
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            internal(format!(
+                "reading DeepSeek response failed (HTTP {status}): {e}"
+            ))
+        })? {
+            if buf.len() as u64 + chunk.len() as u64 > self.max_body {
+                return Err(internal(format!(
+                    "DeepSeek response exceeded the {} MiB limit (DEEPSEEK_MAX_BODY_MB)",
+                    self.max_body / BYTES_PER_MB
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    fn request_error(&self, url: &str, err: &reqwest::Error) -> ErrorData {
+        if err.is_timeout() {
+            internal(format!(
+                "request to {url} timed out after {}s (DEEPSEEK_TIMEOUT_SECS)",
+                self.timeout.as_secs()
+            ))
+        } else if err.is_connect() {
+            internal(format!("cannot connect to {url}: {err}"))
+        } else {
+            internal(format!("request to {url} failed: {err}"))
+        }
+    }
+}
+
+/// `reqwest` is built without a bundled TLS provider so that the build never
+/// needs a C toolchain; install *ring* once, on first use.
+fn install_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 #[derive(Clone)]
@@ -209,9 +253,12 @@ impl DeepSeekWeb {
     async fn search(
         &self,
         Parameters(p): Parameters<SearchParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let p = p.normalize()?;
-        let value = self.post("/v1/tools/search", p).await?;
+        let value = self
+            .post_until_cancelled("/v1/tools/search", p, &context)
+            .await?;
         Ok(CallToolResult::structured(value))
     }
 
@@ -222,9 +269,12 @@ impl DeepSeekWeb {
     async fn fetch(
         &self,
         Parameters(p): Parameters<FetchParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let p = p.normalize()?;
-        let value = self.post("/v1/tools/fetch", p).await?;
+        let value = self
+            .post_until_cancelled("/v1/tools/fetch", p, &context)
+            .await?;
         Ok(CallToolResult::structured(value))
     }
 }
@@ -236,16 +286,21 @@ impl DeepSeekWeb {
 impl ServerHandler for DeepSeekWeb {}
 
 impl DeepSeekWeb {
-    /// Run the blocking HTTP request off the async runtime.
-    async fn post(
+    /// Run one request, racing it against the MCP cancellation token.
+    ///
+    /// When the client sends `notifications/cancelled`, the request future is
+    /// dropped here, which aborts the in-flight HTTP connection instead of
+    /// letting it finish in the background.
+    async fn post_until_cancelled(
         &self,
         path: &'static str,
-        body: impl Serialize + Send + 'static,
+        body: impl Serialize,
+        context: &RequestContext<RoleServer>,
     ) -> Result<Value, ErrorData> {
-        let client = Arc::clone(&self.client);
-        tokio::task::spawn_blocking(move || client.request(path, &body))
-            .await
-            .map_err(|e| internal(format!("request task failed: {e}")))?
+        tokio::select! {
+            result = self.client.request(path, &body) => result,
+            () = context.ct.cancelled() => Err(internal("request cancelled by the MCP client")),
+        }
     }
 }
 
@@ -480,45 +535,52 @@ TOOLS:
 /// `--check`: prove that the key and base URL work, with one real request.
 fn check() -> Result<(), String> {
     let config = Config::from_env()?;
-    println!(
-        "Checking DEEPSEEK_API_KEY against {} (one paid API call, ~$0.00075)...",
-        config.base_url
-    );
-    let client = Client::new(&config);
-    let value = client
-        .request("/v1/tools/search", &SearchParams::probe())
-        .map_err(|e| format!("check failed: {}", e.message))?;
-    let results = value
-        .get("results")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    println!(
-        "OK: key is valid, search returned {} result(s).",
-        results.len()
-    );
-    if let Some(first) = results.first() {
-        let title = first
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("<no title>");
-        let url = first
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or("<no url>");
-        println!("  first: {title} — {url}");
-    }
-    Ok(())
+    runtime()?.block_on(async move {
+        println!(
+            "Checking DEEPSEEK_API_KEY against {} (one paid API call, ~$0.00075)...",
+            config.base_url
+        );
+        let client = Client::new(&config).map_err(|e| e.message.to_string())?;
+        let value = client
+            .request("/v1/tools/search", &SearchParams::probe())
+            .await
+            .map_err(|e| format!("check failed: {}", e.message))?;
+        let results = value
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        println!(
+            "OK: key is valid, search returned {} result(s).",
+            results.len()
+        );
+        if let Some(first) = results.first() {
+            let title = first
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("<no title>");
+            let url = first
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("<no url>");
+            println!("  first: {title} — {url}");
+        }
+        Ok(())
+    })
+}
+
+/// Single-threaded runtime: enough for one stdio session plus in-flight requests.
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start async runtime: {e}"))
 }
 
 fn serve() -> Result<(), String> {
     let config = Config::from_env()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .map_err(|e| format!("cannot start async runtime: {e}"))?;
-    runtime.block_on(async move {
-        let client = Arc::new(Client::new(&config));
+    runtime()?.block_on(async move {
+        let client = Arc::new(Client::new(&config).map_err(|e| e.message.to_string())?);
         let service = DeepSeekWeb { client }
             .serve(stdio())
             .await
@@ -805,5 +867,110 @@ mod tests {
         assert_eq!(probe.count, 1);
         assert!(!probe.need_content);
         assert!(probe.normalize().is_ok());
+    }
+
+    /// Transport-level tests against a local TCP server (no network, no API key).
+    #[cfg(test)]
+    mod transport_tests {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn client_for(addr: std::net::SocketAddr, max_body: u64) -> Client {
+            let config = Config {
+                api_key: "test-key".to_owned(),
+                base_url: format!("http://{addr}"),
+                timeout: Duration::from_secs(30),
+                max_body,
+            };
+            Client::new(&config).expect("client")
+        }
+
+        /// The whole point of moving off a blocking client: dropping the future
+        /// (which is what an MCP cancellation does) must abort the request.
+        #[tokio::test]
+        async fn dropping_a_request_aborts_the_connection() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let received = socket.read(&mut buf).await.unwrap();
+                assert!(received > 0, "server did not receive a request");
+                // Never answer; wait for the client to disappear instead.
+                tokio::time::timeout(Duration::from_secs(10), socket.read(&mut buf))
+                    .await
+                    .expect("client kept the connection open after cancellation")
+                    .unwrap()
+            });
+
+            let client = client_for(addr, BYTES_PER_MB);
+            let probe = SearchParams::probe();
+            let pending = client.request("/v1/tools/search", &probe);
+            let outcome = tokio::time::timeout(Duration::from_millis(250), pending).await;
+            assert!(
+                outcome.is_err(),
+                "request finished although the server never answered"
+            );
+
+            let tail = server.await.expect("server task");
+            assert_eq!(
+                tail, 0,
+                "connection stayed open after the future was dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn oversized_responses_are_rejected_while_streaming() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let body = "x".repeat(3 * BYTES_PER_MB as usize);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+
+            let client = client_for(addr, 2 * BYTES_PER_MB);
+            let err = client
+                .request("/v1/tools/search", &SearchParams::probe())
+                .await
+                .unwrap_err();
+            assert!(err.message.contains("exceeded the 2 MiB limit"), "{err:?}");
+            server.await.expect("server task");
+        }
+
+        #[tokio::test]
+        async fn http_errors_keep_their_json_rpc_code() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"error":{"message":"bad key","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#;
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+
+            let client = client_for(addr, BYTES_PER_MB);
+            let err = client
+                .request("/v1/tools/search", &SearchParams::probe())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert!(err.message.contains("401"), "{err:?}");
+            assert!(err.message.contains("bad key"), "{err:?}");
+            server.await.expect("server task");
+        }
     }
 }
