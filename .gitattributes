@@ -1,0 +1,2 @@
+# Keep shell scripts LF-only so `curl ... | sh` never fails on a CRLF checkout.
+*.sh text eol=lf
